@@ -1,0 +1,16 @@
+{
+  "name": "djitsi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Music bot that joins a self-hosted Jitsi Meet room and plays YouTube audio",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "puppeteer-core": "25.14.0"
+  }
+}

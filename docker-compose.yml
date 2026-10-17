@@ -1,0 +1,29 @@
+services:
+  xray:
+    image: teddysun/xray:latest
+    restart: unless-stopped
+    profiles: ["proxy"]
+    volumes:
+      - ./xray/config.json:/etc/xray/config.json:ro
+    # 8080 and 1080 stay on the Compose network. Do not publish them.
+
+  djitsi:
+    build: ./source
+    image: ghcr.io/santomozzarella/djitsi:latest
+    container_name: djitsi
+    restart: unless-stopped
+    shm_size: 1gb
+    depends_on:
+      xray:
+        condition: service_started
+        required: false
+    environment:
+      ROOM_URL: ${ROOM_URL:?Set ROOM_URL in .env}
+      BOT_NAME: ${BOT_NAME:-DJitsi}
+      # .env: USE_PROXY=off or USE_PROXY=on.
+      USE_PROXY: ${USE_PROXY:-off}
+      YTDLP_PROXY: ${YTDLP_PROXY:-socks5h://xray:1080}
+      # Netscape cookies.txt, if YouTube asks for a signed-in account.
+      # YTDLP_COOKIES: "/cookies/cookies.txt"
+    # volumes:
+    #   - ./cookies.txt:/cookies/cookies.txt:ro

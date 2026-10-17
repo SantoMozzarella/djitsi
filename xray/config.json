@@ -1,0 +1,63 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "dns": {
+    "queryStrategy": "UseIPv4",
+    "servers": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 8080,
+      "protocol": "http",
+      "tag": "http-in",
+      "settings": {}
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 1080,
+      "protocol": "socks",
+      "tag": "socks-in",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "tag": "proxy",
+      "settings": {
+        "vnext": [
+          {
+            "address": "example.com",
+            "port": 443,
+            "users": [
+              {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "www.microsoft.com",
+          "fingerprint": "chrome",
+          "publicKey": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+          "shortId": "",
+          "spiderX": "/"
+        }
+      }
+    }
+  ]
+}
