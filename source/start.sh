@@ -5,6 +5,9 @@ export HOME="${HOME:-/home/bot}"
 export PATH="${HOME}/.local/bin:${PATH}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-bot}"
 
+# A container restart keeps this directory. A dead PulseAudio socket in it
+# makes the next start fail with "Daemon startup failed".
+rm -rf "${XDG_RUNTIME_DIR}"
 mkdir -p "${XDG_RUNTIME_DIR}" "${HOME}/.config/pulse"
 chmod 700 "${XDG_RUNTIME_DIR}"
 

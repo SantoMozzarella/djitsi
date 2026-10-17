@@ -15,6 +15,8 @@ Type these in the room chat.
 | `!play <url or search>`, `!p` | Add a track. If nothing is playing, start it now |
 | `!start` | Start the queue |
 | `!skip`, `!s` | Next track |
+| `!pause` | Pause the current track |
+| `!resume` | Continue the paused track |
 | `!stop` | Stop and clear the queue |
 | `!queue`, `!q` | What is playing, and what is next |
 | `!vol <0-150>` | Volume |

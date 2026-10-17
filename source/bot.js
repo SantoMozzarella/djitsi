@@ -1,6 +1,9 @@
 'use strict';
 
 const { execFile, spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { promisify } = require('util');
 const puppeteer = require('puppeteer-core');
 
@@ -26,6 +29,10 @@ let page = null;
 const queue = [];
 let current = null;
 let player = null;
+let downloader = null;
+let mediaFile = null;
+let mediaReady = false;
+let paused = false;
 let playbackId = 0;
 let playerEpoch = 0;
 let lock = Promise.resolve();
@@ -137,14 +144,6 @@ function ytdlpArgs(extra) {
     return args;
 }
 
-function isHttpProxy(proxy) {
-    return /^https?:\/\//i.test(proxy);
-}
-
-function isSocksProxy(proxy) {
-    return /^socks(?:4a?|5h?):\/\//i.test(proxy);
-}
-
 function pickAudioFormat(info) {
     const formats = Array.isArray(info.formats) ? info.formats : [];
     const audioOnly = formats.filter((format) => {
@@ -192,25 +191,58 @@ async function resolveTrack(query) {
 }
 
 function signalChild(child, signal) {
-    if (!child) return;
-    if (child.exitCode === null) {
-        try {
-            child.kill(signal);
-        } catch (err) {
-            log('Could not stop process: ' + err.message);
-        }
+    if (!child || child.exitCode !== null) return;
+    try {
+        child.kill(signal);
+    } catch (err) {
+        log('Could not stop process: ' + err.message);
     }
-    if (child.downloader) signalChild(child.downloader, signal);
 }
 
-function ffmpegHeaderArgs(headers) {
-    const lines = Object.keys(headers || {}).map((key) => key + ': ' + headers[key]);
-    if (!lines.length) return [];
-    return ['-headers', lines.join('\r\n') + '\r\n'];
+function removeTrackFile(file) {
+    if (!file) return;
+    fs.unlink(file, () => {});
+    fs.unlink(file + '.part', () => {});
+    fs.unlink(file + '.ytdl', () => {});
 }
 
-function wirePlayer(child, track, id) {
-    const epoch = ++playerEpoch;
+function playerIsRunning() {
+    return Boolean(player && player.exitCode === null && player.signalCode === null);
+}
+
+function playbackBusy() {
+    return playerIsRunning() || Boolean(downloader) || paused || mediaReady;
+}
+
+function clearMedia() {
+    const file = mediaFile;
+    mediaFile = null;
+    mediaReady = false;
+    paused = false;
+    removeTrackFile(file);
+}
+
+function settleTrack(epoch, id, notice) {
+    setImmediate(() => {
+        let text = null;
+        withLock(async () => {
+            if (epoch !== playerEpoch || id !== playbackId) return;
+            player = null;
+            downloader = null;
+            current = null;
+            clearMedia();
+            const next = playNext();
+            text = [notice, next].filter(Boolean).join('\n');
+        }).then(() => {
+            if (text) return say(text);
+        }).catch((err) => {
+            log('Error after track: ' + err.message);
+            process.exit(1);
+        });
+    });
+}
+
+function wirePlayer(child, track, id, epoch) {
     player = child;
     let stderr = '';
     child.stderr.on('error', () => {});
@@ -219,134 +251,116 @@ function wirePlayer(child, track, id) {
         if (stderr.length > 2000) stderr = stderr.slice(-2000);
     });
 
-    const finish = (notice) => {
-        setImmediate(() => {
-            let text = null;
-            withLock(async () => {
-                if (epoch !== playerEpoch || id !== playbackId) return;
-                if (player === child) player = null;
-                current = null;
-                const next = playNext();
-                text = [notice, next].filter(Boolean).join('\n');
-            }).then(() => {
-                if (text) return say(text);
-            }).catch((err) => {
-                log('Error after track: ' + err.message);
-                process.exit(1);
-            });
-        });
-    };
-
     child.on('close', (code, signal) => {
+        if (epoch !== playerEpoch || id !== playbackId) return;
         const killed = signal === 'SIGTERM' || signal === 'SIGKILL';
         if (!killed && code !== 0) {
             log('ffmpeg exited with code ' + code + ': ' + stderr.trim());
-            finish('Playback failed for "' + track.title + '", next track');
+            settleTrack(epoch, id, 'Playback failed for "' + track.title + '", next track');
             return;
         }
-        finish(null);
+        settleTrack(epoch, id, null);
     });
 
     child.on('error', (err) => {
+        if (epoch !== playerEpoch || id !== playbackId) return;
         log('Could not start ffmpeg: ' + err.message);
-        finish('Could not start playback for "' + track.title + '"');
+        settleTrack(epoch, id, 'Could not start playback for "' + track.title + '"');
     });
-}
-
-function playerIsRunning() {
-    return Boolean(player && player.exitCode === null && player.signalCode === null);
 }
 
 function playerEnv() {
     return Object.assign({}, process.env, { PULSE_PROP: 'application.name=music-bot' });
 }
 
-function spawnPlayer(track, id) {
-    if (isSocksProxy(YTDLP_PROXY)) {
-        spawnViaSocks(track, id);
-        return;
-    }
-
-    const args = [
-        '-hide_banner',
-        '-loglevel', 'warning',
-        '-nostdin',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-rw_timeout', '20000000',
-    ];
-    if (isHttpProxy(YTDLP_PROXY)) args.push('-http_proxy', YTDLP_PROXY);
-    args.push.apply(args, ffmpegHeaderArgs(track.headers));
-    args.push('-i', track.url, '-vn', '-ac', '2', '-f', 'pulse', '-name', 'music-bot', 'music');
-
-    const child = spawn('ffmpeg', args, {
-        stdio: ['ignore', 'ignore', 'pipe'],
-        env: playerEnv(),
-    });
-    wirePlayer(child, track, id);
-}
-
-function spawnViaSocks(track, id) {
-    const downloader = spawn('yt-dlp', ytdlpArgs([
-        '--no-progress',
-        '--retries', '10',
-        '--fragment-retries', '10',
-        '--socket-timeout', '20',
-        '-f', 'bestaudio/best',
-        '-o', '-',
-        track.source,
-    ]), {
-        stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
+function startPlayback(track, id, epoch) {
+    if (epoch !== playerEpoch || id !== playbackId || paused || !mediaFile || playerIsRunning()) return;
     const child = spawn('ffmpeg', [
         '-hide_banner',
         '-loglevel', 'warning',
         '-nostdin',
-        '-i', 'pipe:0',
+        '-i', mediaFile,
         '-vn',
         '-ac', '2',
         '-f', 'pulse',
         '-name', 'music-bot',
         'music',
     ], {
-        stdio: ['pipe', 'ignore', 'pipe'],
+        stdio: ['ignore', 'ignore', 'pipe'],
         env: playerEnv(),
     });
-    child.downloader = downloader;
-    child.stdin.on('error', () => {});
-    downloader.stdout.on('error', () => {});
-    downloader.stdout.pipe(child.stdin);
+    wirePlayer(child, track, id, epoch);
+}
 
+function beginTrack(track, id) {
+    const epoch = ++playerEpoch;
+    const file = path.join(os.tmpdir(), 'djitsi-' + process.pid + '-' + Date.now());
+    mediaFile = file;
+    mediaReady = false;
+    paused = false;
+    player = null;
+
+    const dl = spawn('yt-dlp', ytdlpArgs([
+        '--no-progress',
+        '--no-part',
+        '--retries', '10',
+        '--fragment-retries', '10',
+        '--socket-timeout', '20',
+        '-f', 'bestaudio/best',
+        '-o', file,
+        track.source,
+    ]), {
+        stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    downloader = dl;
     let stderr = '';
-    downloader.stderr.on('data', (chunk) => {
+    dl.stderr.on('error', () => {});
+    dl.stderr.on('data', (chunk) => {
         stderr += chunk.toString();
         if (stderr.length > 2000) stderr = stderr.slice(-2000);
     });
-    downloader.on('close', (code) => {
-        if (child.stdin) child.stdin.end();
-        if (code) log('yt-dlp stream exited with code ' + code + ': ' + stderr.trim());
-    });
-    downloader.on('error', (err) => {
+    dl.on('error', (err) => {
+        if (epoch !== playerEpoch || id !== playbackId) return;
         log('Could not start yt-dlp: ' + err.message);
-        if (child.stdin) child.stdin.end();
+        settleTrack(epoch, id, 'Could not start playback for "' + track.title + '"');
     });
-
-    wirePlayer(child, track, id);
+    dl.on('close', (code) => {
+        setImmediate(() => {
+            let text = null;
+            withLock(async () => {
+                if (epoch !== playerEpoch || id !== playbackId) {
+                    removeTrackFile(file);
+                    return;
+                }
+                if (downloader === dl) downloader = null;
+                if (code !== 0) {
+                    log('yt-dlp exited with code ' + code + ': ' + stderr.trim());
+                    player = null;
+                    current = null;
+                    clearMedia();
+                    const next = playNext();
+                    text = ['Playback failed for "' + track.title + '", next track', next].filter(Boolean).join('\n');
+                    return;
+                }
+                mediaReady = true;
+                if (!paused) startPlayback(track, id, epoch);
+            }).then(() => {
+                if (text) return say(text);
+            }).catch((err) => {
+                log('Error after download: ' + err.message);
+                process.exit(1);
+            });
+        });
+    });
 }
 
 function playNext() {
-    if (player && !playerIsRunning()) {
-        player = null;
-        current = null;
-    }
-    if (playerIsRunning()) return null;
+    if (playbackBusy()) return null;
     current = null;
     const track = queue.shift();
     if (!track) return null;
     current = track;
-    spawnPlayer(track, playbackId);
+    beginTrack(track, playbackId);
     return 'Playing: ' + track.title;
 }
 
@@ -366,7 +380,7 @@ async function handlePlay(query) {
         await say('Could not load "' + text + '": ' + explainDownloadError(err));
         let next = null;
         await withLock(async () => {
-            if (id !== playbackId || playerIsRunning()) return;
+            if (id !== playbackId || playbackBusy()) return;
             next = playNext();
         });
         if (next) await say(next);
@@ -376,13 +390,13 @@ async function handlePlay(query) {
     let notice = null;
     await withLock(async () => {
         if (id !== playbackId) return;
-        if (playerIsRunning()) {
+        if (playbackBusy()) {
             queue.push(track);
             notice = 'Added to queue: ' + track.title;
             return;
         }
         current = track;
-        spawnPlayer(track, playbackId);
+        beginTrack(track, playbackId);
         notice = 'Playing: ' + track.title;
     });
     if (notice) await say(notice);
@@ -391,15 +405,19 @@ async function handlePlay(query) {
 function detachPlayer() {
     playerEpoch += 1;
     const child = player;
+    const dl = downloader;
     player = null;
+    downloader = null;
     current = null;
+    clearMedia();
     signalChild(child, 'SIGKILL');
+    signalChild(dl, 'SIGKILL');
 }
 
 async function handleSkip() {
     let notice = null;
     await withLock(async () => {
-        if (!playerIsRunning() && queue.length === 0) {
+        if (!playbackBusy() && queue.length === 0) {
             notice = 'Queue is empty';
             return;
         }
@@ -410,10 +428,47 @@ async function handleSkip() {
     if (notice) await say(notice);
 }
 
+async function handlePause() {
+    let notice = null;
+    await withLock(async () => {
+        if (!current) {
+            notice = 'Nothing is playing';
+            return;
+        }
+        if (paused) {
+            notice = 'Already paused';
+            return;
+        }
+        paused = true;
+        if (playerIsRunning()) signalChild(player, 'SIGSTOP');
+        notice = 'Paused: ' + current.title;
+    });
+    if (notice) await say(notice);
+}
+
+async function handleResume() {
+    let notice = null;
+    await withLock(async () => {
+        if (!paused || !current) {
+            notice = 'Nothing is paused';
+            return;
+        }
+        paused = false;
+        if (playerIsRunning()) signalChild(player, 'SIGCONT');
+        else if (mediaReady) startPlayback(current, playbackId, playerEpoch);
+        notice = 'Resumed: ' + current.title;
+    });
+    if (notice) await say(notice);
+}
+
 async function handleStart() {
     let notice = null;
     await withLock(async () => {
-        if (playerIsRunning()) {
+        if (paused && current) {
+            notice = 'Paused: ' + current.title;
+            return;
+        }
+        if (playbackBusy()) {
             notice = current ? ('Already playing: ' + current.title) : 'Already playing';
             return;
         }
@@ -438,7 +493,9 @@ async function handleStop() {
 
 async function handleQueue() {
     const lines = [];
-    lines.push(current ? ('Now: ' + current.title) : 'Nothing is playing');
+    if (!current) lines.push('Nothing is playing');
+    else if (paused) lines.push('Paused: ' + current.title);
+    else lines.push('Now: ' + current.title);
     if (queue.length === 0) {
         lines.push('Queue is empty');
     } else {
@@ -474,6 +531,8 @@ async function handleHelp() {
         '!play <url or search> (!p) — add to the queue and start if nothing is playing',
         '!start — start the queue if nothing is playing',
         '!skip (!s) — next track',
+        '!pause — pause the current track',
+        '!resume — continue the paused track',
         '!stop — stop playback and clear the queue',
         '!queue (!q) — what is playing and the queue',
         '!vol <0-150> — volume',
@@ -500,6 +559,12 @@ function handleCommand(text) {
             break;
         case 'start':
             job = () => handleStart();
+            break;
+        case 'pause':
+            job = () => handlePause();
+            break;
+        case 'resume':
+            job = () => handleResume();
             break;
         case 'stop':
             job = () => handleStop();
@@ -747,10 +812,12 @@ async function main() {
         executablePath: CHROMIUM_PATH,
         headless: false,
         timeout: 60000,
+        ignoreHTTPSErrors: true,
         ignoreDefaultArgs: ['--mute-audio'],
         defaultViewport: { width: 1280, height: 720 },
         args: [
             '--no-sandbox',
+            '--ignore-certificate-errors',
             '--use-fake-ui-for-media-stream',
             '--autoplay-policy=no-user-gesture-required',
             '--disable-dev-shm-usage',
